@@ -21,7 +21,7 @@
     "@axe-core/playwright": "^4.10.1",
     "axe-core": "^4.10.2",
     "chrome-launcher": "^1.1.2",
-    "commander": "^12.1.0",
+    "commander": "^15.0.0",
     "lighthouse": "^13.4.1",
     "picocolors": "^1.1.1",
     "playwright": "^1.48.2",
