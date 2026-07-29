@@ -114,7 +114,13 @@ fails a PR on what the PR introduces, while the whole repo is still covered:
   the PR's commits (`base..head`); `sast` runs semgrep diff-aware
   (`--baseline-commit <base>`) so only findings **new since the PR base** count.
   A pre-existing finding in an untouched file never fails a PR. The gate sets the
-  scope automatically via `LGTM_SECRETS_LOG_OPTS` / `LGTM_SAST_BASELINE_REF`.
+  scope automatically via `LGTM_SECRETS_LOG_OPTS` / `LGTM_SAST_BASELINE_REF`. A PR
+  whose diff is entirely binary assets and/or deletions (regenerated screenshots,
+  a removed doc) skips `sast` — not fails it — since diff-aware semgrep opens
+  nothing in that case and there is no source to have an opinion on. `sast` still
+  hard-fails on a **full-tree** 0-file scan (unset baseline, i.e. the sweep below):
+  that is the real, permanent gap this guard exists to catch — a repo whose
+  language nothing in the rulesets understands.
 - **Scheduled sweep (`sweep.yml`, non-blocking)** runs both full-scope on a cron:
   `secrets` walks the **full history** (catches a secret committed-then-deleted in
   old history), `sast` scans the **whole tree** (the pre-existing backlog). Wire

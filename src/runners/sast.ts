@@ -6,6 +6,7 @@ import type {
   RunnerOutcome,
 } from "../types.js";
 import { dockerRun } from "../util/docker.js";
+import { exec } from "../util/exec.js";
 
 // Static analysis via Semgrep (container) using curated security rulesets.
 // White-box: needs the repo checkout. Ruleset fetch needs network.
@@ -21,7 +22,46 @@ const CONFIGS = ["p/security-audit", "p/secrets", "p/owasp-top-ten", "p/javascri
 // scan, which owns the backlog. Diff mode needs git inside the container to
 // reach the baseline, so the checkout is mounted read-write and git safe.directory
 // is pre-set to dodge the "dubious ownership" refusal on the foreign-uid mount.
-const BASELINE_REF = process.env.LGTM_SAST_BASELINE_REF?.trim() || "";
+//
+// Read per-call (not hoisted to a module constant) so tests can set the env
+// var per-case without fighting module-load ordering.
+function baselineRef(): string {
+  return process.env.LGTM_SAST_BASELINE_REF?.trim() || "";
+}
+
+/**
+ * `git diff --numstat` renders a binary file's add/delete counts as the
+ * literal string "-" — the only signal numstat gives for "no computable
+ * content diff". That is exactly the class of change (a regenerated
+ * screenshot, a deleted doc) a text-based scanner never had an opinion on.
+ * True iff at least one line is a real, non-binary content change.
+ */
+export function numstatHasTextChanges(numstat: string): boolean {
+  return numstat
+    .split("\n")
+    .filter(Boolean)
+    .some((line) => {
+      const [added, deleted] = line.split("\t");
+      return added !== "-" && deleted !== "-";
+    });
+}
+
+/**
+ * Does the diff against `ref` touch any non-binary added/modified/renamed
+ * file? `--diff-filter=ACMR` drops pure deletions — nothing is left at HEAD
+ * for a scanner to read — so a diff that is entirely deletions and/or binary
+ * assets comes back false. Returns null ("couldn't tell") on any git
+ * failure, so the caller falls through to the real scan instead of silently
+ * skipping it on an infra hiccup.
+ */
+async function diffTouchesText(repo: string, ref: string): Promise<boolean | null> {
+  const r = await exec("git", ["diff", "--diff-filter=ACMR", "--numstat", ref, "HEAD"], {
+    cwd: repo,
+    timeoutMs: 30_000,
+  });
+  if (r.code !== 0) return null;
+  return numstatHasTextChanges(r.stdout);
+}
 
 const SEVERITY_MAP: Record<string, Finding["severity"]> = {
   ERROR: "high",
@@ -61,9 +101,29 @@ export const sastRunner: Runner = {
   },
 
   async observe(ctx: RunnerContext): Promise<RunnerOutcome> {
-    const findings: Finding[] = [];
     const repo = ctx.site.repoPath!;
+    const ref = baselineRef();
 
+    // Diff-aware mode: semgrep --baseline-commit only opens files that differ
+    // from the baseline, so "0 files scanned" is the EXPECTED result when a
+    // PR's diff is entirely deletions and/or binary assets (docs pruned,
+    // screenshots regenerated) — there is no source a text-based scanner
+    // could ever have an opinion on. Checked with plain git, before spending
+    // a container run on a scan that can only come back empty. A full-tree
+    // sweep (ref unset) always proceeds and keeps the original guard below:
+    // that path is exactly what catches a repo whose language nothing here
+    // understands, and it must keep failing on it.
+    if (ref) {
+      const hasText = await diffTouchesText(repo, ref);
+      if (hasText === false) {
+        return {
+          kind: "notApplicable",
+          note: `diff against ${ref.slice(0, 8)} touches no non-binary added/modified file — nothing for static analysis to scan`,
+        };
+      }
+    }
+
+    const findings: Finding[] = [];
     const configArgs = CONFIGS.flatMap((c) => ["--config", c]);
     const r = await dockerRun({
       image: IMAGE,
@@ -95,12 +155,12 @@ export const sastRunner: Runner = {
         "4000",
         // Diff-aware when the caller passes a baseline: only findings introduced
         // since that ref are reported (the gate sets it to the PR base SHA).
-        ...(BASELINE_REF ? ["--baseline-commit", BASELINE_REF] : []),
+        ...(ref ? ["--baseline-commit", ref] : []),
         "/src",
       ],
       // Full scan is read-only; diff mode needs git to reach the baseline commit,
       // so mount RW and pre-declare /src a safe.directory (foreign-uid mount).
-      ...(BASELINE_REF
+      ...(ref
         ? {
             mountsRW: { "/src": repo },
             extra: [
