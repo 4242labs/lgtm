@@ -82,10 +82,12 @@ npm run audit -- run mysite --url https://example.com
 # Subset of checks:
 npm run audit -- run mysite --only headers,a11y,cookies
 
-# Everything except a subset (the inverse of --only):
+# Everything except a subset — NOT combinable with --only (--only wins outright,
+# --skip is silently ignored if both are passed in the same run):
 npm run audit -- run mysite --skip zap,lighthouse
 
-# Override the site's failOn threshold for this run:
+# Override the site's failOn threshold for this run (critical|high|medium|low —
+# the CLI rejects anything else, so a typo can't silently disable the gate):
 npm run audit -- run mysite --fail-on critical
 
 # Active/attacking DAST — localhost ONLY, opt-in:
