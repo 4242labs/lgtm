@@ -9,6 +9,15 @@ import { loadSite } from "./config.js";
 import { runAudit } from "./orchestrator.js";
 import { writeReports, consoleSummary } from "./report.js";
 import { ALL_RUNNERS } from "./runners/index.js";
+import { SEVERITY_ORDER, type Severity } from "./types.js";
+
+// The CLI-facing subset: `info` is a real Severity, but computePass() (see
+// scoring.ts) already skips every info-severity finding regardless of
+// failOn — an "info" threshold can never fail a run today, on the YAML path
+// either. Excluding it here isn't about preventing a failure mode; it's
+// that offering it as a choice would promise a behavior ("fail on
+// informational findings") the scorer doesn't implement.
+const FAIL_ON_CHOICES = SEVERITY_ORDER.filter((s) => s !== "info") as Severity[];
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const SITES_DIR = resolve(HERE, "..", "sites");
@@ -46,7 +55,23 @@ program
   .action(async (site: string, opts) => {
     const cfg = loadSite(sitePath(site));
     if (opts.url) cfg.baseUrl = opts.url;
-    if (opts.failOn) cfg.failOn = opts.failOn;
+    if (opts.failOn !== undefined) {
+      // computePass()/atLeastAsSevere() index into SEVERITY_ORDER; a typo'd
+      // value here is not "unknown severity" to them, it's -1 — every real
+      // severity then reads as "less severe than the threshold" and the gate
+      // passes silently. Unvalidated, this flag can disable the gate by typo.
+      // `!== undefined` (not truthy) so an empty string is rejected too,
+      // rather than silently falling back to the site's configured failOn.
+      if (!FAIL_ON_CHOICES.includes(opts.failOn)) {
+        console.error(
+          pc.red(
+            `--fail-on must be one of ${FAIL_ON_CHOICES.join("|")} (got "${opts.failOn}")`,
+          ),
+        );
+        process.exit(2);
+      }
+      cfg.failOn = opts.failOn;
+    }
     if (opts.skip) cfg.skip = [...(cfg.skip ?? []), ...String(opts.skip).split(",")];
 
     const isLocal = /^(https?:\/\/)?(localhost|127\.0\.0\.1)/.test(cfg.baseUrl);
