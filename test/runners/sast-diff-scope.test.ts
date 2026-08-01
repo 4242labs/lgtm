@@ -156,6 +156,30 @@ describe("sast.ts — diff-scoped gate on a binary/deletion-only PR", () => {
     expect(r.note).toMatch(/scanned 0 files/i);
   });
 
+  // jubs-app PR #39 (2026-08-01): a one-line change to `tests/test_web_session.py` and
+  // nothing else. The diff has real text changes, so the pre-scan guard correctly let
+  // semgrep run — and semgrep then opened ZERO files, because p/security-audit and friends
+  // carry `paths: exclude` filters for test files. Reported as insufficient evidence, that
+  // made the gate unpassable for ANY test-only pull request in every repo on the fleet
+  // gate: no commit could produce a file the rulesets agree to read.
+  it("is notApplicable — not a coverage hole — when every changed file is excluded by the rulesets", async () => {
+    writeFileSync(join(repo, "app.ts"), "export const x = 3;\n");
+    git("add -A");
+    git('commit -q -m "change source the rulesets happen to exclude"');
+    process.env.LGTM_SAST_BASELINE_REF = baseline;
+    // semgrep ran, understood the language, and filtered every candidate out.
+    dockerRunMock.mockResolvedValue(
+      ok(JSON.stringify({ results: [], errors: [], paths: { scanned: [] } })),
+    );
+
+    const r = await derive(sastRunner, ctx(repo));
+
+    expect(dockerRunMock).toHaveBeenCalledTimes(1); // the scan DID run
+    expect(r.status).toBe("skipped");
+    expect(r.waived).toBe(true); // notApplicable, not "could not conclude"
+    expect(r.note).toMatch(/excluded by the rulesets/i);
+  });
+
   it("falls through to the real scan (does not silently skip) when git itself fails to resolve the baseline", async () => {
     process.env.LGTM_SAST_BASELINE_REF = "0000000000000000000000000000000000dead";
     dockerRunMock.mockResolvedValue(
