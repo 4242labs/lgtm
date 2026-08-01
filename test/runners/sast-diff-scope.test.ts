@@ -180,6 +180,49 @@ describe("sast.ts — diff-scoped gate on a binary/deletion-only PR", () => {
     expect(r.note).toMatch(/excluded by the rulesets/i);
   });
 
+  // Adversarial review of block 06-02 (2026-08-01) turned PR #33's waive into a bypass:
+  // semgrep honours `.semgrepignore` and `.gitignore`, both of which live in the tree under
+  // review and are editable by the very pull request being judged. Add `*` to
+  // `.semgrepignore` and ANY diff — production code, command injection and all — scans zero
+  // files and was waived as "excluded by the rulesets". The waive is now withheld unless
+  // nothing repo-controlled could have caused the zero.
+  it("REFUSES to waive when a .semgrepignore could have zeroed the scan", async () => {
+    writeFileSync(join(repo, "charge-card.ts"), "export const run = (c: string) => eval(c);\n");
+    writeFileSync(join(repo, ".semgrepignore"), "*\n");
+    git("add -A");
+    git('commit -q -m "production change, plus an ignore file that hides it"');
+    process.env.LGTM_SAST_BASELINE_REF = baseline;
+    dockerRunMock.mockResolvedValue(
+      ok(JSON.stringify({ results: [], errors: [], paths: { scanned: [] } })),
+    );
+
+    const r = await derive(sastRunner, ctx(repo));
+
+    expect(dockerRunMock).toHaveBeenCalledTimes(1);
+    expect(r.status).toBe("error"); // insufficient evidence, NOT waived
+    expect(r.waived).not.toBe(true);
+  });
+
+  // A .gitignore rule on a TRACKED file is deliberately NOT treated as suppression: git
+  // check-ignore excludes tracked paths by design, and semgrep scans them too — so the file
+  // is in the diff, readable, and genuinely excluded by the rulesets rather than hidden. An
+  // untracked file cannot appear in the diff at all. The guard therefore keys on the file
+  // semgrep alone honours, `.semgrepignore`, and this case must still waive.
+  it("still waives on a rulesets-excluded diff when no ignore file is present", async () => {
+    writeFileSync(join(repo, "app.ts"), "export const x = 4;\n");
+    git("add -A");
+    git('commit -q -m "ordinary change the rulesets happen to exclude"');
+    process.env.LGTM_SAST_BASELINE_REF = baseline;
+    dockerRunMock.mockResolvedValue(
+      ok(JSON.stringify({ results: [], errors: [], paths: { scanned: [] } })),
+    );
+
+    const r = await derive(sastRunner, ctx(repo));
+
+    expect(r.status).toBe("skipped");
+    expect(r.waived).toBe(true);
+  });
+
   it("falls through to the real scan (does not silently skip) when git itself fails to resolve the baseline", async () => {
     process.env.LGTM_SAST_BASELINE_REF = "0000000000000000000000000000000000dead";
     dockerRunMock.mockResolvedValue(
