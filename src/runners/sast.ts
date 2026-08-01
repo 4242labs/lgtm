@@ -5,6 +5,8 @@ import type {
   RunnerContext,
   RunnerOutcome,
 } from "../types.js";
+import { existsSync } from "node:fs";
+import { join } from "node:path";
 import { dockerRun } from "../util/docker.js";
 import { exec } from "../util/exec.js";
 
@@ -61,6 +63,44 @@ async function diffTouchesText(repo: string, ref: string): Promise<boolean | nul
   });
   if (r.code !== 0) return null;
   return numstatHasTextChanges(r.stdout);
+}
+
+/**
+ * Could something the REPO controls have zeroed the scan, rather than the rulesets?
+ *
+ * Semgrep honours `.semgrepignore` and (by default) `.gitignore`, both of which live in the
+ * tree under review and are editable by the same pull request the gate is judging. So
+ * "scanned 0 files" has a third meaning beyond "no source" and "rulesets excluded it":
+ * *the diff told the scanner not to look*. Waiving on that is a bypass — add `*` to
+ * `.semgrepignore` and any change at all sails through as `notApplicable`.
+ *
+ * `deps.ts` learned the same lesson and answers it with osv-scanner's `--no-ignore`; semgrep
+ * has no equivalent that can be relied on across versions, so this asks the question directly
+ * instead: if an ignore file is present, or git itself would exclude one of the changed
+ * files, the waive is withheld and the original insufficient-evidence failure stands.
+ *
+ * Returns true when a waive is safe — nothing repo-controlled could have caused the zero.
+ */
+export async function nothingRepoControlledSuppressedTheScan(
+  repo: string,
+  ref: string,
+): Promise<boolean> {
+  if (existsSync(join(repo, ".semgrepignore"))) return false;
+
+  const changed = await exec("git", ["diff", "--diff-filter=ACMR", "--name-only", ref, "HEAD"], {
+    cwd: repo,
+    timeoutMs: 30_000,
+  });
+  if (changed.code !== 0) return false; // could not tell → do not waive
+  const files = changed.stdout.split("\n").filter(Boolean);
+  if (files.length === 0) return false;
+
+  // `check-ignore` exits 0 when at least one path IS ignored.
+  const ignored = await exec("git", ["check-ignore", "--quiet", "--", ...files], {
+    cwd: repo,
+    timeoutMs: 30_000,
+  });
+  return ignored.code !== 0;
 }
 
 const SEVERITY_MAP: Record<string, Finding["severity"]> = {
@@ -235,7 +275,7 @@ export const sastRunner: Runner = {
     // The full-tree sweep (no baseline ref) is deliberately untouched — there,
     // zero files scanned really does mean the rulesets understand nothing in the
     // repo, and `sufficient()` must keep failing on it.
-    if (ref && scanned.length === 0) {
+    if (ref && scanned.length === 0 && (await nothingRepoControlledSuppressedTheScan(repo, ref))) {
       return {
         kind: "notApplicable",
         note: `every file changed since ${ref.slice(0, 8)} is excluded by the rulesets (${CONFIGS.join(", ")}) — nothing for static analysis to scan`,
