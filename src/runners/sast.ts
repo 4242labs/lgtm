@@ -221,6 +221,27 @@ export const sastRunner: Runner = {
 
     const scanned = out.paths?.scanned ?? [];
 
+    // Diff-aware mode, zero files opened: the diff had real text changes (the
+    // pre-scan guard above already ruled out deletion/binary-only), so semgrep
+    // read the changed files and every one of them was filtered out by the
+    // rulesets' own `paths: exclude` — test files being the common case, since
+    // p/security-audit and friends exclude them by design.
+    //
+    // That is "these rules have no opinion here", not "we failed to gather
+    // evidence". Reporting it as insufficient made the gate UNPASSABLE for any
+    // test-only pull request, in every repo on the fleet gate: nothing a commit
+    // could change would produce a file the rulesets agree to read.
+    //
+    // The full-tree sweep (no baseline ref) is deliberately untouched — there,
+    // zero files scanned really does mean the rulesets understand nothing in the
+    // repo, and `sufficient()` must keep failing on it.
+    if (ref && scanned.length === 0) {
+      return {
+        kind: "notApplicable",
+        note: `every file changed since ${ref.slice(0, 8)} is excluded by the rulesets (${CONFIGS.join(", ")}) — nothing for static analysis to scan`,
+      };
+    }
+
     return {
       kind: "observed",
       note: out.errors?.length ? `${out.errors.length} scan error(s)` : undefined,
