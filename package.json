@@ -25,7 +25,7 @@
     "lighthouse": "^13.4.1",
     "picocolors": "^1.1.1",
     "playwright": "^1.48.2",
-    "tldts": "^7.4.8",
+    "tldts": "^7.4.10",
     "yaml": "^2.6.1",
     "zod": "^4.4.3"
   },
