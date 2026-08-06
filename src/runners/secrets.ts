@@ -9,6 +9,7 @@ import type {
   RunnerOutcome,
 } from "../types.js";
 import { dockerRun, transientInfraFailure } from "../util/docker.js";
+import { exec } from "../util/exec.js";
 
 // Leaked-credential scan via gitleaks (container), over the repo's git history
 // and working tree. White-box: needs the repo checkout.
@@ -72,6 +73,58 @@ function scanLog(stderr: string): { commits: number; bytes: number } {
   };
 }
 
+/**
+ * Corroborate an empty-evidence scoped scan against git.
+ *
+ * gitleaks in --log-opts mode scans only the ADDED TEXT of the diff. A file it
+ * cannot diff — a binary/undiffable blob (keystore, archive, anything git marks
+ * binary) — contributes no scannable bytes AND, when it is the only change in a
+ * commit, is not even counted as a "commit scanned". So a range that *adds a
+ * secret inside a binary file* comes back "0 commits / ~0 bytes / no leaks" —
+ * indistinguishable, on gitleaks' output alone, from a range that added nothing
+ * at all. Passing the gate on that absence is a bypass.
+ *
+ * git settles it, walked the SAME way gitleaks walks — commit by commit over
+ * `git log <range>`, not a single net `git diff`. Per-commit matters: a binary
+ * secret added in one commit of the range and deleted in a later one nets to
+ * nothing in a `diff` but still ships in history under a merge/rebase-merge, and
+ * `git log`'s two-dot range semantics match gitleaks' exactly (a net `diff`'s do
+ * not). `--diff-filter=ACMRT` keeps every way content ENTERS the tree — added,
+ * copied, modified, renamed, and TYPE-CHANGED (symlink/gitlink → regular file,
+ * status `T`, which a bare ACMR silently drops) — and excludes pure deletions;
+ * `-M` resolves renames so an unchanged rename reads 0/0, not a fake add. A
+ * binary file shows its add-count as the literal "-"; a text file shows a
+ * number. So the range added content gitleaks needed to read iff any numstat
+ * line's add-count is anything other than "0" (a positive count = added text
+ * gitleaks somehow missed; "-" = an unscannable file it never opened).
+ *
+ * Returns true (range added such content — do NOT certify on absence of
+ * evidence), false (pure deletions / rename / mode-only — genuinely nothing to
+ * scan), or null (could not corroborate: log-opts is not a plain base..head
+ * range, or git failed — caller fails closed).
+ */
+export async function rangeAddsUnscannedContent(
+  repo: string,
+  logOpts: string,
+): Promise<boolean | null> {
+  // Only a plain `base..head` (or `base...head`) range is safe to hand to git.
+  // Each endpoint must start alphanumeric and hold only ref-safe characters:
+  // this rejects a leading "-" (which git parses as a FLAG, not a rev — e.g.
+  // `--output=/tmp/x..y` would slip past a laxer `[^\s]+` and become an
+  // arbitrary-file-write argv injection) as well as anything with whitespace.
+  if (!/^[A-Za-z0-9][\w./-]*\.\.\.?[A-Za-z0-9][\w./-]*$/.test(logOpts)) return null;
+  const r = await exec(
+    "git",
+    ["log", "--diff-filter=ACMRT", "--numstat", "--format=", "-M", logOpts],
+    { cwd: repo, timeoutMs: 30_000 },
+  );
+  if (r.code !== 0) return null;
+  return r.stdout
+    .split("\n")
+    .filter(Boolean)
+    .some((line) => line.split("\t")[0] !== "0");
+}
+
 export const secretsRunner: Runner = {
   id: "secrets",
   domain: "secrets",
@@ -79,20 +132,36 @@ export const secretsRunner: Runner = {
   requires: { repo: true, docker: true },
 
   sufficient(cov: Coverage): string | null {
-    if (Number(cov.data.commits ?? 0) === 0) {
-      // Diff-scoped PR mode (a base..head range was set): an empty range — 0
-      // commits — means the PR introduced no new commits to scan, so there is
-      // nothing it could have leaked. That is a clean pass, not missing
-      // evidence. Only an UNSCOPED full-history scan (the sweep) that sees 0
-      // commits signals a non-repo path or an empty history.
-      return cov.data.scoped
-        ? null
-        : "gitleaks scanned 0 commits — the path is not a git repository, or has no history";
+    const commits = Number(cov.data.commits ?? 0);
+    const bytes = Number(cov.data.bytes ?? 0);
+
+    // The scan examined real content — gitleaks walked commits AND read bytes.
+    if (commits > 0 && bytes > 0) return null;
+
+    // Empty evidence: gitleaks examined no content (0 commits, or 0 scanned
+    // bytes). For an UNSCOPED full-history scan that is a real anomaly — a path
+    // that is not a git repo / has no history (0 commits), or blobs it could
+    // not read (0 bytes) — so refuse.
+    if (!cov.data.scoped) {
+      return commits === 0
+        ? "gitleaks scanned 0 commits — the path is not a git repository, or has no history"
+        : "gitleaks read 0 bytes — nothing was actually examined";
     }
-    if (Number(cov.data.bytes ?? 0) === 0) {
-      return "gitleaks read 0 bytes — nothing was actually examined";
+
+    // SCOPED PR gate with empty evidence. This is clean ONLY if the PR's range
+    // added no content gitleaks needed to read: a range that is pure deletions
+    // (or rename/mode-only) introduced nothing that could carry a secret. But
+    // gitleaks reports "no content" identically whether the range added nothing
+    // or added a file it could not scan (a binary/undiffable blob that may hide
+    // a secret) — so absence of evidence alone must not pass. `addedContent` is
+    // git's numstat corroboration of which case this is.
+    if (cov.data.addedContent === false) return null;
+    if (cov.data.addedContent === true) {
+      return "gitleaks examined no content, but the PR added a file it could not scan (binary/undiffable) — cannot certify no secret was introduced";
     }
-    return null;
+    // null: the range could not be corroborated (log-opts is not a plain
+    // base..head range, or git failed) — fail closed rather than certify blind.
+    return "gitleaks examined no content and the PR range could not be corroborated — refusing to certify a clean result";
   },
 
   async observe(ctx: RunnerContext): Promise<RunnerOutcome> {
@@ -186,7 +255,17 @@ export const secretsRunner: Runner = {
           };
         }
       }
-      return collect(leaks, commits, bytes, findings);
+      // Only the empty-evidence path (0 commits or 0 bytes) needs the git
+      // corroboration; a scan that read real bytes is self-evidently sufficient,
+      // so skip the extra git call. Unscoped sweeps are never corroborated —
+      // their empty-evidence verdict does not depend on a diff range.
+      const scoped = Boolean(LOG_OPTS);
+      const addedContent =
+        scoped && (commits === 0 || bytes === 0)
+          ? await rangeAddsUnscannedContent(repo, LOG_OPTS)
+          : null;
+
+      return collect(leaks, commits, bytes, findings, scoped, addedContent);
     } finally {
       rmSync(work, { recursive: true, force: true });
     }
@@ -198,6 +277,8 @@ function collect(
   commits: number,
   bytes: number,
   findings: Finding[],
+  scoped: boolean,
+  addedContent: boolean | null,
 ): RunnerOutcome {
   // Collapse duplicate rule+file pairs (a secret repeated across history).
   {
@@ -217,17 +298,32 @@ function collect(
       });
     }
 
+    const trail = [
+      LOG_OPTS
+        ? `scanned ${commits} commit${commits === 1 ? "" : "s"} in the PR range (${LOG_OPTS})`
+        : `scanned ${commits} commit${commits === 1 ? "" : "s"} of history`,
+      `read ${bytes} bytes of content`,
+    ];
+    // On the empty-evidence path, record what git's numstat said about the
+    // range so the verdict is traceable to evidence, not just gitleaks' silence.
+    if (addedContent === false) {
+      trail.push("git corroboration: PR range added no scannable content (deletions / rename / mode only)");
+    } else if (addedContent === true) {
+      trail.push("git corroboration: PR range added a file gitleaks could not scan (binary/undiffable)");
+    }
+
+    // Omit addedContent when it could not be determined (null): sufficient()
+    // then reads it as undefined and fails closed, rather than storing a null
+    // the Coverage.data type does not allow.
+    const data: Coverage["data"] = { commits, bytes, scoped };
+    if (addedContent !== null) data.addedContent = addedContent;
+
     return {
       kind: "observed",
       findings,
       coverage: {
-        trail: [
-          LOG_OPTS
-            ? `scanned ${commits} commit${commits === 1 ? "" : "s"} in the PR range (${LOG_OPTS})`
-            : `scanned ${commits} commit${commits === 1 ? "" : "s"} of history`,
-          `read ${bytes} bytes of content`,
-        ],
-        data: { commits, bytes, scoped: Boolean(LOG_OPTS) },
+        trail,
+        data,
         provenance: "gitleaks scan log (stderr)",
       },
       meta: { leakCount: findings.length, commits, bytes },
