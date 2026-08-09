@@ -135,6 +135,17 @@ fails a PR on what the PR introduces, while the whole repo is still covered:
   it per repo (see `sweep.yml` header); a finding reds the scheduled run, never a
   PR.
 
+Binary blobs are covered too. gitleaks only ever sees diff text, so a PR that
+adds a PDF, an image, a font or a keystore hands it nothing to read. Rather than
+refuse on that silence — which blocked every such PR and still never looked
+inside the file — `secrets` reads each undiffable blob back out of the commit
+that introduced it, reduces it to its printable runs (the `strings(1)` view,
+behind an ASCII header so gitleaks does not sniff the format and skip it), and
+scans that. The byte count of that pass is the evidence the gate certifies on.
+Compressed content inside a blob has no readable run, so a clean result there
+means *no secret in the readable bytes* — the coverage trail says so rather than
+implying more.
+
 A found secret is remediated by **rotating the credential and purging it from
 history** (git filter-repo / BFG) — not by narrowing the scan. A pre-existing
 sast finding is fixed at source (or documented inline with `# nosemgrep`).
