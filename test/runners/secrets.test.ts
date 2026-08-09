@@ -9,6 +9,7 @@ import {
   rangeAddedContent,
   renamedTo,
   printableRuns,
+  stringsFile,
 } from "../../src/runners/secrets.js";
 import type { Coverage } from "../../src/types.js";
 
@@ -205,6 +206,28 @@ describe("printableRuns", () => {
   it("keeps a run that ends at the last byte", () => {
     expect(printableRuns(Buffer.from([0x00, ...Buffer.from("trailing")]))).toBe(
       "trailing\n",
+    );
+  });
+});
+
+// ── stringsFile — the extract must not re-trigger gitleaks' format sniff ────
+describe("stringsFile", () => {
+  it("keeps a format's magic off the first bytes — a PDF extract still starts %PDF", () => {
+    const pdf = Buffer.concat([
+      Buffer.from("%PDF-1.4\n1 0 obj\n"),
+      Buffer.from([0x00, 0xff]),
+      Buffer.from("aws_key = \"AKIAQYLPMN5HHHFPZAAA\""),
+    ]);
+    const out = stringsFile("doc.pdf", pdf);
+    expect(out.startsWith("%PDF")).toBe(false);
+    expect(out.split("\n")[0]).toBe("lgtm: printable runs of doc.pdf");
+    // and the payload is still there to be found
+    expect(out).toContain("AKIAQYLPMN5HHHFPZAAA");
+  });
+
+  it("still writes the header when the blob has nothing readable", () => {
+    expect(stringsFile("empty.bin", Buffer.from([0x00, 0x01]))).toBe(
+      "lgtm: printable runs of empty.bin\n",
     );
   });
 });
