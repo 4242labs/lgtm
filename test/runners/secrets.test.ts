@@ -6,6 +6,9 @@ import { execFileSync } from "node:child_process";
 import {
   secretsRunner,
   rangeAddsUnscannedContent,
+  rangeAddedContent,
+  renamedTo,
+  printableRuns,
 } from "../../src/runners/secrets.js";
 import type { Coverage } from "../../src/types.js";
 
@@ -105,6 +108,118 @@ describe("secretsRunner.sufficient — scoped empty-evidence needs git corrobora
     expect(reason).not.toBeNull();
     expect(reason).toMatch(/could not be corroborated/);
   });
+
+  // ── the undiffable blobs were read back and scanned directly ──
+  // Refusing on a binary the diff pass never opened is safe but empty: it blocks
+  // every PR shipping a PDF or an image and still never looks inside the file.
+  // A second pass that reads the blobs out of git IS evidence, so it certifies.
+  it("PASSES when every undiffable blob was scanned directly and that pass read bytes", () => {
+    expect(
+      secretsRunner.sufficient(
+        cov({
+          commits: 0,
+          bytes: 0,
+          scoped: true,
+          addedContent: true,
+          undiffableBlobs: 2,
+          undiffableScanned: 2,
+          undiffableBytes: 640_000,
+        }),
+        CTX,
+      ),
+    ).toBeNull();
+  });
+
+  it("REFUSES when only some of the undiffable blobs were scanned", () => {
+    const reason = secretsRunner.sufficient(
+      cov({
+        commits: 0,
+        bytes: 0,
+        scoped: true,
+        addedContent: true,
+        undiffableBlobs: 3,
+        undiffableScanned: 2,
+        undiffableBytes: 640_000,
+      }),
+      CTX,
+    );
+    expect(reason).toMatch(/could not scan/);
+  });
+
+  it("REFUSES when the blob pass reported 0 bytes — a scan that read nothing is not evidence", () => {
+    const reason = secretsRunner.sufficient(
+      cov({
+        commits: 0,
+        bytes: 0,
+        scoped: true,
+        addedContent: true,
+        undiffableBlobs: 1,
+        undiffableScanned: 1,
+        undiffableBytes: 0,
+      }),
+      CTX,
+    );
+    expect(reason).toMatch(/could not scan/);
+  });
+
+  it("REFUSES a range that added TEXT gitleaks did not read, blob pass or not", () => {
+    const reason = secretsRunner.sufficient(
+      cov({ commits: 0, bytes: 0, scoped: true, addedContent: true }),
+      CTX,
+    );
+    expect(reason).toMatch(/could not scan/);
+  });
+});
+
+// ── printableRuns — what a scanner can actually read out of a binary ────────
+// gitleaks skips binaries in every mode, so a blob is only scannable once it is
+// reduced to its printable runs. These are the guarantees that reduction must
+// hold: the credential survives, the noise does not.
+describe("printableRuns", () => {
+  it("recovers a credential planted between non-printable bytes", () => {
+    const buf = Buffer.concat([
+      Buffer.from([0x00, 0xff, 0x00]),
+      Buffer.from('aws_key = "AKIAQYLPMN5HHHFPZAAA"'),
+      Buffer.from([0x00, 0x01]),
+    ]);
+    expect(printableRuns(buf)).toContain("AKIAQYLPMN5HHHFPZAAA");
+  });
+
+  it("drops runs shorter than the minimum — noise, not credentials", () => {
+    expect(printableRuns(Buffer.from([0x41, 0x00, 0x42, 0x43, 0x00]))).toBe("");
+  });
+
+  it("splits runs onto their own lines so one match cannot span two of them", () => {
+    const buf = Buffer.concat([
+      Buffer.from("first-run"),
+      Buffer.from([0x00]),
+      Buffer.from("second-run"),
+    ]);
+    expect(printableRuns(buf)).toBe("first-run\nsecond-run\n");
+  });
+
+  it("returns empty for a blob with nothing readable in it", () => {
+    expect(printableRuns(Buffer.from([0x00, 0x01, 0x02, 0xfe, 0xff]))).toBe("");
+  });
+
+  it("keeps a run that ends at the last byte", () => {
+    expect(printableRuns(Buffer.from([0x00, ...Buffer.from("trailing")]))).toBe(
+      "trailing\n",
+    );
+  });
+});
+
+// ── renamedTo — git's rename notation resolves to the path holding the blob ──
+describe("renamedTo", () => {
+  it("resolves the braced form to the new path", () => {
+    expect(renamedTo("public/{old => new}/file.pdf")).toBe("public/new/file.pdf");
+  });
+  it("resolves the plain form to the new path", () => {
+    expect(renamedTo("a/old.pdf => a/new.pdf")).toBe("a/new.pdf");
+  });
+  it("leaves an unrenamed path alone", () => {
+    expect(renamedTo("a/plain.pdf")).toBe("a/plain.pdf");
+  });
 });
 
 // ── rangeAddsUnscannedContent — the git corroboration itself ────────────────
@@ -188,6 +303,63 @@ describe("rangeAddsUnscannedContent — git corroboration of a scoped range", ()
   it("null — a non-range log-opts is not corroboratable (fail closed)", async () => {
     expect(await rangeAddsUnscannedContent(repo, "--all")).toBeNull();
     expect(await rangeAddsUnscannedContent(repo, sha())).toBeNull(); // single rev, no range
+  });
+
+  it("splits added text from the undiffable blobs, tagging each with its commit", async () => {
+    const base = sha();
+    bin("keystore.bin");
+    commit("add binary");
+    const binCommit = sha();
+    writeFileSync(join(repo, "new.txt"), "hello\n");
+    commit("add text");
+
+    const r = await rangeAddedContent(repo, `${base}..${sha()}`);
+    expect(r).not.toBeNull();
+    expect(r!.addedText).toBe(true);
+    expect(r!.undiffable).toEqual([{ commit: binCommit, path: "keystore.bin" }]);
+  });
+
+  it("still names a blob added then deleted inside the range, at the commit that added it", async () => {
+    const base = sha();
+    bin("transient.bin");
+    commit("add binary secret");
+    const added = sha();
+    rmSync(join(repo, "transient.bin"));
+    commit("delete it again");
+
+    const r = await rangeAddedContent(repo, `${base}..${sha()}`);
+    expect(r!.addedText).toBe(false);
+    expect(r!.undiffable).toEqual([{ commit: added, path: "transient.bin" }]);
+    // The blob is gone from the tree but still readable at that commit — which
+    // is the whole point of tagging it.
+    expect(
+      execFileSync("git", ["cat-file", "-t", `${added}:transient.bin`], {
+        cwd: repo,
+        encoding: "utf8",
+      }).trim(),
+    ).toBe("blob");
+  });
+
+  it("reports a renamed binary at its NEW path, where the blob can be read", async () => {
+    bin("old.bin");
+    commit("seed a binary");
+    const base = sha();
+    git("mv", "old.bin", "moved.bin");
+    commit("rename the binary");
+    const renamed = sha();
+
+    // git renders a binary rename as "-\t-\told => new" — never "0" — so it
+    // reads as undiffable even though nothing new entered the tree. Naming the
+    // NEW path is what matters: that is where the blob is readable.
+    const r = await rangeAddedContent(repo, `${base}..${renamed}`);
+    expect(r!.addedText).toBe(false);
+    expect(r!.undiffable).toEqual([{ commit: renamed, path: "moved.bin" }]);
+    expect(
+      execFileSync("git", ["cat-file", "-t", `${renamed}:moved.bin`], {
+        cwd: repo,
+        encoding: "utf8",
+      }).trim(),
+    ).toBe("blob");
   });
 
   it("null — a leading-dash range is rejected before it reaches git (argv-injection guard)", async () => {
