@@ -1,4 +1,11 @@
-import { mkdirSync, readFileSync, existsSync, rmSync, chmodSync } from "node:fs";
+import {
+  mkdirSync,
+  readFileSync,
+  writeFileSync,
+  existsSync,
+  rmSync,
+  chmodSync,
+} from "node:fs";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import type {
@@ -98,31 +105,207 @@ function scanLog(stderr: string): { commits: number; bytes: number } {
  * line's add-count is anything other than "0" (a positive count = added text
  * gitleaks somehow missed; "-" = an unscannable file it never opened).
  *
- * Returns true (range added such content — do NOT certify on absence of
- * evidence), false (pure deletions / rename / mode-only — genuinely nothing to
- * scan), or null (could not corroborate: log-opts is not a plain base..head
- * range, or git failed — caller fails closed).
+ * Returns the split — text the range added (a positive add-count) and the
+ * undiffable blobs it added (add-count "-"), each tagged with the commit that
+ * introduced it so the blob can be read back even if a later commit in the
+ * range deleted it. Null means the range could not be corroborated (log-opts is
+ * not a plain base..head range, or git failed) and the caller fails closed.
  */
-export async function rangeAddsUnscannedContent(
+export interface RangeContent {
+  /** Some file in the range gained readable text gitleaks should have seen. */
+  addedText: boolean;
+  /** Blobs git marks undiffable — gitleaks never opened these. */
+  undiffable: { commit: string; path: string }[];
+}
+
+export async function rangeAddedContent(
   repo: string,
   logOpts: string,
-): Promise<boolean | null> {
+): Promise<RangeContent | null> {
   // Only a plain `base..head` (or `base...head`) range is safe to hand to git.
   // Each endpoint must start alphanumeric and hold only ref-safe characters:
   // this rejects a leading "-" (which git parses as a FLAG, not a rev — e.g.
   // `--output=/tmp/x..y` would slip past a laxer `[^\s]+` and become an
   // arbitrary-file-write argv injection) as well as anything with whitespace.
   if (!/^[A-Za-z0-9][\w./-]*\.\.\.?[A-Za-z0-9][\w./-]*$/.test(logOpts)) return null;
+  // `--format=%H` stamps each commit before its own numstat block, so an
+  // undiffable path stays tied to the commit that introduced it.
   const r = await exec(
     "git",
-    ["log", "--diff-filter=ACMRT", "--numstat", "--format=", "-M", logOpts],
+    ["log", "--diff-filter=ACMRT", "--numstat", "--format=%H", "-M", logOpts],
     { cwd: repo, timeoutMs: 30_000 },
   );
   if (r.code !== 0) return null;
-  return r.stdout
-    .split("\n")
-    .filter(Boolean)
-    .some((line) => line.split("\t")[0] !== "0");
+
+  const out: RangeContent = { addedText: false, undiffable: [] };
+  let commit = "";
+  for (const line of r.stdout.split("\n")) {
+    if (!line) continue;
+    if (/^[0-9a-f]{40}$/.test(line)) {
+      commit = line;
+      continue;
+    }
+    const cols = line.split("\t");
+    const adds = cols[0];
+    // `-M` renders a rename as "old => new" or "pre{old => new}post"; the blob
+    // lives at the NEW path, which is what has to be read back.
+    const path = renamedTo(cols[cols.length - 1] ?? "");
+    if (adds === "-") {
+      if (path) out.undiffable.push({ commit, path });
+    } else if (adds !== "0") {
+      out.addedText = true;
+    }
+  }
+  return out;
+}
+
+/** Resolve git's rename notation to the path the blob ends up at. */
+export function renamedTo(spec: string): string {
+  const braced = spec.match(/^(.*)\{.* => (.*)\}(.*)$/);
+  if (braced) return `${braced[1]}${braced[2]}${braced[3]}`.replace(/\/\//g, "/");
+  const plain = spec.match(/^.* => (.*)$/);
+  return plain?.[1] ?? spec;
+}
+
+/**
+ * The boolean the gate used before blobs were read directly: did the range add
+ * anything gitleaks needed to read but did not?
+ */
+export async function rangeAddsUnscannedContent(
+  repo: string,
+  logOpts: string,
+): Promise<boolean | null> {
+  const r = await rangeAddedContent(repo, logOpts);
+  if (r === null) return null;
+  return r.addedText || r.undiffable.length > 0;
+}
+
+/**
+ * The `strings(1)` view of a blob: every run of printable ASCII at least
+ * `min` long, one per line. Short runs are dropped because they are noise, not
+ * credentials — every secret pattern gitleaks knows is longer than that.
+ */
+export function printableRuns(buf: Buffer, min = 6): string {
+  const out: string[] = [];
+  let run = "";
+  for (const byte of buf) {
+    // Printable ASCII plus tab: the bytes a credential can be written in.
+    if ((byte >= 0x20 && byte <= 0x7e) || byte === 0x09) {
+      run += String.fromCharCode(byte);
+    } else {
+      if (run.length >= min) out.push(run);
+      run = "";
+    }
+  }
+  if (run.length >= min) out.push(run);
+  return out.length ? out.join("\n") + "\n" : "";
+}
+
+interface BlobScan {
+  /** How many of the range's undiffable blobs were materialized and scanned. */
+  scanned: number;
+  /** Bytes the filesystem pass reported reading — the evidence of real work. */
+  bytes: number;
+  leaks: Leak[];
+}
+
+/**
+ * Read the undiffable blobs back out of git and scan them directly.
+ *
+ * gitleaks in `--log-opts` mode only ever sees diff text, so a blob git marks
+ * binary passes through the gate unread. Refusing on that absence is safe but
+ * useless: it blocks every PR that ships a PDF, an image or a font, and it
+ * still never looks inside the one file that could be hiding a key.
+ *
+ * Handing gitleaks the blob itself does not help — it skips binaries in every
+ * mode (verified against the pinned image: a file holding a live-shaped AWS key
+ * between NUL bytes scans as "~0 bytes, no leaks"). So the blob is reduced to
+ * what a scanner can actually read: its printable runs, the `strings(1)` view,
+ * written to a text sidecar that gitleaks then scans for real. A key pasted into
+ * a PDF, a keystore, an image comment or a font table lands in those runs and is
+ * caught — which the old refusal never did.
+ *
+ * The residual is compression: a secret inside a deflated PDF stream or a zip
+ * member has no printable run to find, so a clean result here means "no secret
+ * in the readable bytes", not "no secret". That is stated in the trail rather
+ * than papered over, and it is strictly more evidence than refusing to look.
+ *
+ * `git cat-file` pulls each blob out of the commit that introduced it, so one
+ * added and deleted inside the range is still examined. Returns null if any blob
+ * could not be read or the scan produced no report — the caller then keeps the
+ * old refusal rather than certifying on a partial look.
+ */
+async function scanUndiffableBlobs(
+  repo: string,
+  blobs: { commit: string; path: string }[],
+  work: string,
+): Promise<BlobScan | null> {
+  const dir = join(work, "blobs");
+  mkdirSync(dir, { recursive: true });
+  chmodSync(dir, 0o777); // the image runs as a non-root uid
+
+  let scanned = 0;
+  for (const [i, blob] of blobs.entries()) {
+    const r = await exec("git", ["cat-file", "blob", `${blob.commit}:${blob.path}`], {
+      cwd: repo,
+      timeoutMs: 30_000,
+      encoding: "buffer",
+    });
+    if (r.code !== 0) return null;
+    // Flatten to an index-prefixed basename: no path traversal out of the mount,
+    // no collisions between same-named files from different directories.
+    const safe = (blob.path.split("/").pop() || "blob").replace(/[^\w.-]/g, "_");
+    const text = printableRuns(r.stdoutRaw ?? Buffer.from(r.stdout));
+    writeFileSync(join(dir, `${i}-${safe}.strings.txt`), text);
+    scanned++;
+  }
+  if (scanned === 0) return null;
+
+  const reportPath = join(work, "gitleaks-blobs.json");
+  const r = await dockerRun({
+    image: IMAGE,
+    args: [
+      "dir",
+      "/blobs",
+      "--config",
+      "/config/gitleaks.toml",
+      "--report-format",
+      "json",
+      "--report-path",
+      "/out/gitleaks-blobs.json",
+      "--redact",
+      "--no-banner",
+      "--exit-code",
+      "0",
+    ],
+    mounts: { "/config/gitleaks.toml": BASELINE_CONFIG },
+    mountsRW: { "/out": work, "/blobs": dir },
+    timeoutMs: TIMEOUT_MS,
+    retryOn: (res) => !res.timedOut && transientInfraFailure(res),
+  });
+  if (!existsSync(reportPath)) return null;
+
+  const raw = readFileSync(reportPath, "utf8").trim();
+  let leaks: Leak[] = [];
+  if (raw.length > 0) {
+    try {
+      const parsed = JSON.parse(raw);
+      if (!Array.isArray(parsed)) return null;
+      leaks = parsed;
+    } catch {
+      return null;
+    }
+  }
+  const { bytes } = scanLog(r.stderr);
+  // A pass that read nothing is not evidence, whatever it reported.
+  if (bytes === 0) return null;
+  // Report the real path, not the flattened scratch name.
+  for (const leak of leaks) {
+    const m = leak.File?.match(/(?:^|\/)(\d+)-/);
+    const src = m ? blobs[Number(m[1])] : undefined;
+    if (src) leak.File = src.path;
+  }
+  return { scanned, bytes, leaks };
 }
 
 export const secretsRunner: Runner = {
@@ -157,6 +340,14 @@ export const secretsRunner: Runner = {
     // git's numstat corroboration of which case this is.
     if (cov.data.addedContent === false) return null;
     if (cov.data.addedContent === true) {
+      // The blobs gitleaks could not diff were read back and scanned directly
+      // (filesystem mode), so the range IS covered — by a second pass whose own
+      // byte count is the evidence. Only certify when every undiffable blob was
+      // scanned and that pass actually read bytes.
+      const total = Number(cov.data.undiffableBlobs ?? 0);
+      const scanned = Number(cov.data.undiffableScanned ?? 0);
+      const blobBytes = Number(cov.data.undiffableBytes ?? 0);
+      if (total > 0 && scanned === total && blobBytes > 0) return null;
       return "gitleaks examined no content, but the PR added a file it could not scan (binary/undiffable) — cannot certify no secret was introduced";
     }
     // null: the range could not be corroborated (log-opts is not a plain
@@ -260,12 +451,27 @@ export const secretsRunner: Runner = {
       // so skip the extra git call. Unscoped sweeps are never corroborated —
       // their empty-evidence verdict does not depend on a diff range.
       const scoped = Boolean(LOG_OPTS);
-      const addedContent =
+      const range =
         scoped && (commits === 0 || bytes === 0)
-          ? await rangeAddsUnscannedContent(repo, LOG_OPTS)
+          ? await rangeAddedContent(repo, LOG_OPTS)
           : null;
+      const addedContent =
+        range === null ? null : range.addedText || range.undiffable.length > 0;
 
-      return collect(leaks, commits, bytes, findings, scoped, addedContent);
+      // The range added nothing but blobs gitleaks could not diff: read them
+      // back and scan them directly rather than refusing on their silence. Skip
+      // it when the range also added TEXT that gitleaks should have seen and
+      // did not — that is a real anomaly in the scan, not a coverage gap.
+      const blobScan =
+        range && !range.addedText && range.undiffable.length > 0
+          ? await scanUndiffableBlobs(repo, range.undiffable, work)
+          : null;
+      if (blobScan) leaks = leaks.concat(blobScan.leaks);
+
+      return collect(leaks, commits, bytes, findings, scoped, addedContent, {
+        total: range?.undiffable.length ?? 0,
+        scan: blobScan,
+      });
     } finally {
       rmSync(work, { recursive: true, force: true });
     }
@@ -279,6 +485,7 @@ function collect(
   findings: Finding[],
   scoped: boolean,
   addedContent: boolean | null,
+  blobs: { total: number; scan: BlobScan | null } = { total: 0, scan: null },
 ): RunnerOutcome {
   // Collapse duplicate rule+file pairs (a secret repeated across history).
   {
@@ -311,12 +518,26 @@ function collect(
     } else if (addedContent === true) {
       trail.push("git corroboration: PR range added a file gitleaks could not scan (binary/undiffable)");
     }
+    if (blobs.scan) {
+      trail.push(
+        `read ${blobs.scan.scanned} of ${blobs.total} undiffable blob${blobs.total === 1 ? "" : "s"} back out of git and scanned their printable runs — ${blobs.scan.bytes} bytes (compressed content inside a blob has no readable run and is not covered)`,
+      );
+    } else if (blobs.total > 0) {
+      trail.push(
+        `${blobs.total} undiffable blob${blobs.total === 1 ? "" : "s"} in the range could not be read back and scanned`,
+      );
+    }
 
     // Omit addedContent when it could not be determined (null): sufficient()
     // then reads it as undefined and fails closed, rather than storing a null
     // the Coverage.data type does not allow.
     const data: Coverage["data"] = { commits, bytes, scoped };
     if (addedContent !== null) data.addedContent = addedContent;
+    if (blobs.total > 0) {
+      data.undiffableBlobs = blobs.total;
+      data.undiffableScanned = blobs.scan?.scanned ?? 0;
+      data.undiffableBytes = blobs.scan?.bytes ?? 0;
+    }
 
     return {
       kind: "observed",
@@ -324,7 +545,9 @@ function collect(
       coverage: {
         trail,
         data,
-        provenance: "gitleaks scan log (stderr)",
+        provenance: blobs.scan
+        ? "gitleaks scan log (stderr), plus a filesystem pass over the range's undiffable blobs"
+        : "gitleaks scan log (stderr)",
       },
       meta: { leakCount: findings.length, commits, bytes },
     };

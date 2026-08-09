@@ -5,6 +5,13 @@ export interface ExecResult {
   stdout: string;
   stderr: string;
   timedOut: boolean;
+  /**
+   * Raw stdout bytes. Present only when the caller passes `encoding: "buffer"`,
+   * which it must whenever stdout is not text: decoding arbitrary bytes as UTF-8
+   * replaces every invalid sequence with U+FFFD, so a binary blob round-tripped
+   * through `stdout` is not the blob any more. In buffer mode `stdout` is empty.
+   */
+  stdoutRaw?: Buffer;
 }
 
 /**
@@ -14,9 +21,14 @@ export interface ExecResult {
 export function exec(
   cmd: string,
   args: string[],
-  opts: { cwd?: string; timeoutMs?: number; env?: NodeJS.ProcessEnv } = {},
+  opts: {
+    cwd?: string;
+    timeoutMs?: number;
+    env?: NodeJS.ProcessEnv;
+    encoding?: "utf8" | "buffer";
+  } = {},
 ): Promise<ExecResult> {
-  const { cwd, timeoutMs = 300_000, env } = opts;
+  const { cwd, timeoutMs = 300_000, env, encoding = "utf8" } = opts;
   return new Promise((resolve, reject) => {
     const child = spawn(cmd, args, {
       cwd,
@@ -24,12 +36,15 @@ export function exec(
     });
     let stdout = "";
     let stderr = "";
+    const chunks: Buffer[] = [];
     let timedOut = false;
     const timer = setTimeout(() => {
       timedOut = true;
       child.kill("SIGKILL");
     }, timeoutMs);
-    child.stdout.on("data", (d) => (stdout += d.toString()));
+    child.stdout.on("data", (d) =>
+      encoding === "buffer" ? chunks.push(d as Buffer) : (stdout += d.toString()),
+    );
     child.stderr.on("data", (d) => (stderr += d.toString()));
     child.on("error", (err) => {
       clearTimeout(timer);
@@ -37,7 +52,9 @@ export function exec(
     });
     child.on("close", (code) => {
       clearTimeout(timer);
-      resolve({ code: code ?? -1, stdout, stderr, timedOut });
+      const res: ExecResult = { code: code ?? -1, stdout, stderr, timedOut };
+      if (encoding === "buffer") res.stdoutRaw = Buffer.concat(chunks);
+      resolve(res);
     });
   });
 }
