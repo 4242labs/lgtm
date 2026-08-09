@@ -21,17 +21,17 @@
     "@axe-core/playwright": "^4.10.1",
     "axe-core": "^4.10.2",
     "chrome-launcher": "^1.1.2",
-    "commander": "^12.1.0",
+    "commander": "^15.0.0",
     "lighthouse": "^13.4.1",
     "picocolors": "^1.1.1",
-    "playwright": "^1.48.2",
-    "tldts": "^7.4.8",
+    "playwright": "^1.62.1",
+    "tldts": "^7.4.10",
     "yaml": "^2.6.1",
     "zod": "^4.4.3"
   },
   "devDependencies": {
-    "@types/node": "^26.1.1",
-    "tsx": "^4.19.2",
+    "@types/node": "^26.1.2",
+    "tsx": "^4.23.1",
     "typescript": "^7.0.2",
     "vitest": "^4.1.10"
   }
