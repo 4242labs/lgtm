@@ -201,6 +201,23 @@ export function printableRuns(buf: Buffer, min = 6): string {
   return out.length ? out.join("\n") + "\n" : "";
 }
 
+/**
+ * The scannable text for one blob: its printable runs behind a plain-ASCII
+ * header line.
+ *
+ * The header is load-bearing, not a label. gitleaks sniffs a file's type from
+ * its leading bytes and skips anything it decides is a known binary format —
+ * and a PDF's printable runs still START with "%PDF-", so the extract was
+ * sniffed as a PDF and skipped, scanning 0 bytes. Verified against the pinned
+ * image: the same 396 KB of text scans 0 bytes with the magic leading, 396,138
+ * bytes with one ASCII line in front of it. Any format whose magic survives the
+ * extraction (PDF, PostScript, SVG, plist) would hit this, so the header goes
+ * on unconditionally.
+ */
+export function stringsFile(path: string, buf: Buffer): string {
+  return `lgtm: printable runs of ${path}\n${printableRuns(buf)}`;
+}
+
 interface BlobScan {
   /** How many of the range's undiffable blobs were materialized and scanned. */
   scanned: number;
@@ -255,7 +272,7 @@ async function scanUndiffableBlobs(
     // Flatten to an index-prefixed basename: no path traversal out of the mount,
     // no collisions between same-named files from different directories.
     const safe = (blob.path.split("/").pop() || "blob").replace(/[^\w.-]/g, "_");
-    const text = printableRuns(r.stdoutRaw ?? Buffer.from(r.stdout));
+    const text = stringsFile(blob.path, r.stdoutRaw ?? Buffer.from(r.stdout));
     writeFileSync(join(dir, `${i}-${safe}.strings.txt`), text);
     scanned++;
   }
