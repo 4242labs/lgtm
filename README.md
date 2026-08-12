@@ -1,5 +1,8 @@
 # lgtm
 
+[![Project Status: Active](https://www.repostatus.org/badges/latest/active.svg)](https://www.repostatus.org/#active)
+[![Maintenance](https://img.shields.io/badge/maintenance-passively--maintained-yellowgreen.svg)](CONTRIBUTING.md)
+
 > _"looks good to me"_ — except this one actually checks.
 
 A config-driven audit harness that runs current best-practice **security,
