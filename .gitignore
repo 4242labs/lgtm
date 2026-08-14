@@ -8,3 +8,9 @@ sites/*.storageState.json
 # real site configs stay local; only the template is committed
 sites/*.yaml
 !sites/example.yaml
+
+# Claude Code -- local-only files stay untracked (kit hygiene)
+.claude/settings.local.json
+.claude/worktrees/
+.claude/hooks/*.local.json
+.worktrees/
