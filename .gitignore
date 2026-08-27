@@ -14,3 +14,7 @@ sites/*.yaml
 .claude/worktrees/
 .claude/hooks/*.local.json
 .worktrees/
+
+# Python bytecode from running .github/scripts locally
+__pycache__/
+*.pyc
