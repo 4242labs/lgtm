@@ -78,6 +78,7 @@ const { depsRunner } = await import("../../src/runners/deps.js");
 const { secretsRunner } = await import("../../src/runners/secrets.js");
 const { sastRunner } = await import("../../src/runners/sast.js");
 const { zapRunner } = await import("../../src/runners/zap.js");
+const { runAudit } = await import("../../src/orchestrator.js");
 
 let workRoot: string;
 let cwdSpy: ReturnType<typeof vi.spyOn>;
@@ -203,10 +204,97 @@ describe("tls.ts — testssl severity mapping", () => {
     expect(r.findings).toEqual([]);
   });
 
-  it("skips an http/localhost target — there is no TLS to inspect", async () => {
+  it("an http/localhost target is not applicable — excused, not a coverage hole", async () => {
     const r = await derive(tlsRunner, ctx({ baseUrl: "http://localhost:3000" }));
     expect(r.status).toBe("skipped");
     expect(dockerRunMock).not.toHaveBeenCalled();
+    // The load-bearing assertion. `status` is "skipped" for BOTH kinds of "did
+    // not run", so checking it alone (as this test used to) cannot tell "there
+    // is no TLS here" from "we never checked the TLS". `waived` is the flag the
+    // orchestrator reads to decide whether the run may still pass, and it was
+    // false here while the runner returned `unavailable`.
+    expect(r.waived).toBe(true);
+  });
+
+  it("a PUBLIC plaintext http target is NOT excused — the domain applies and is failing", async () => {
+    const r = await derive(tlsRunner, ctx({ baseUrl: "http://example.com" }));
+    expect(r.status).toBe("skipped");
+    expect(dockerRunMock).not.toHaveBeenCalled();
+    // The opposite verdict to localhost, from the same absence of a TLS
+    // endpoint. Here the transport domain exists and the site is failing it
+    // outright, so the absence stays an unwaived coverage hole.
+    expect(r.waived).toBe(false);
+    // …and it must not be described as the localhost case it is not.
+    expect(r.note).toMatch(/plaintext http/i);
+  });
+});
+
+// The misclassification this guards against is invisible from the runner
+// alone: derive() maps BOTH notApplicable and unavailable to status "skipped",
+// so nothing short of a whole run shows what it actually cost. Driven through
+// the real orchestrator against the real tlsRunner, because the question is
+// exactly whether this runner's outcome lets a run reach a verdict.
+describe("tlsRunner — an http dev server does not hold the whole run hostage", () => {
+  it("a localhost run stays complete and can pass with tls in play", async () => {
+    const site: SiteConfig = {
+      name: "mysite",
+      baseUrl: "http://localhost:3000",
+      routes: [],
+      auth: { type: "none" },
+      failOn: "high",
+    };
+    const report = await runAudit({
+      site,
+      baseUrl: site.baseUrl,
+      outDir: "",
+      stamp: "t",
+      allowActive: false,
+      only: ["tls"],
+    });
+
+    const tls = report.results.find((r) => r.runnerId === "tls")!;
+    expect(tls.status).toBe("skipped");
+    expect(tls.note).toMatch(/no TLS to inspect/i);
+    expect(dockerRunMock).not.toHaveBeenCalled();
+
+    // "tls did not run" is still stated on the record, exactly as before …
+    const entry = report.notAudited.find((n) => n.runnerId === "tls")!;
+    // … but as an EXCUSED absence rather than a coverage hole.
+    expect(entry.waived).toBe(true);
+    expect(report.notAudited.filter((n) => !n.waived)).toEqual([]);
+
+    // The symptom that sent us here: both of these were false, so the config
+    // sites/example.yaml ships — baseUrl http://localhost:3000 — exited 1
+    // however clean the site was, until `tls` was waived by hand.
+    expect(report.complete).toBe(true);
+    expect(report.passed).toBe(true);
+  });
+
+  it("does NOT hand the same excuse to a public plaintext site", async () => {
+    const site: SiteConfig = {
+      name: "plaintext",
+      baseUrl: "http://example.com",
+      routes: [],
+      auth: { type: "none" },
+      failOn: "high",
+    };
+    const report = await runAudit({
+      site,
+      baseUrl: site.baseUrl,
+      outDir: "",
+      stamp: "t",
+      allowActive: false,
+      // `--only tls` is the case that makes this load-bearing: `headers` is
+      // the runner that would otherwise raise `no-tls` as high, and here it
+      // never runs at all. If tls excused itself, a public site served over
+      // plaintext would audit clean with zero findings.
+      only: ["tls"],
+    });
+
+    const entry = report.notAudited.find((n) => n.runnerId === "tls")!;
+    expect(entry.waived).toBe(false);
+    expect(report.complete).toBe(false);
+    expect(report.passed).toBe(false);
   });
 });
 

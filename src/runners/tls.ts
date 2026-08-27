@@ -79,10 +79,39 @@ export const tlsRunner: Runner = {
     const findings: Finding[] = [];
     const url = ctx.run.baseUrl;
 
-    if (!url.startsWith("https://") || isLocalhostUrl(url)) {
+    // Two targets reach this runner with nothing to hand testssl.sh, and they
+    // are opposites. Collapsing them into one branch is what made the harness
+    // unusable locally; collapsing them the other way would be far worse.
+    //
+    // A dev server on localhost has no transport layer to form an opinion
+    // about, so the domain does not exist for this target: `notApplicable`,
+    // nothing missed, the run is free to reach a verdict. Reporting it as
+    // `unavailable` made the project's own headline workflow impossible to
+    // pass. sites/example.yaml ships baseUrl http://localhost:3000, so copying
+    // the template as the README instructs produced an unwaived hole for a TLS
+    // endpoint that was never there, and exit 1 until `tls` was waived by hand.
+    if (isLocalhostUrl(url)) {
+      return {
+        kind: "notApplicable",
+        note: "no TLS to inspect (http/localhost target)",
+      };
+    }
+
+    // A public site served over plaintext is the opposite case. The transport
+    // domain very much applies here, the site is simply failing it outright,
+    // and nothing about that is excusable. `unavailable` keeps it an unwaived
+    // coverage hole so the run cannot pass on it.
+    //
+    // The `headers` runner does raise this as the high-severity `no-tls`
+    // finding, but only while `headers` is in the run: `--only tls` and
+    // `--skip headers` are both supported, and either one leaves that verdict
+    // with nobody to state it. An excuse that depends on another runner having
+    // been invited is not an excuse, and a silent pass here is the exact
+    // false all-clear this harness exists to refuse.
+    if (!url.startsWith("https://")) {
       return {
         kind: "unavailable",
-        note: "no TLS to inspect (http/localhost target)",
+        note: "target is served over plaintext http — no TLS endpoint to audit",
       };
     }
 
