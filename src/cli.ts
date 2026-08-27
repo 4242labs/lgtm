@@ -19,6 +19,46 @@ import { SEVERITY_ORDER, type Severity } from "./types.js";
 // informational findings") the scorer doesn't implement.
 const FAIL_ON_CHOICES = SEVERITY_ORDER.filter((s) => s !== "info") as Severity[];
 
+const KNOWN_RUNNER_IDS = ALL_RUNNERS.map((r) => r.id);
+
+/**
+ * Parse a comma-separated runner-id list, and refuse an unknown id while we
+ * still know which flag the operator actually typed.
+ *
+ * Both halves of that were wrong for `--skip`. It never got the `.trim()`
+ * `--only` has, so `--skip "zap, lighthouse"` carried the space into the id
+ * and died on " lighthouse" — a shell habit, not a typo, and one the README's
+ * own prose invites. And because `--skip` is merged into cfg.skip before the
+ * orchestrator sees it, its guard could only attribute the bad id to "the site
+ * config's `skip:`", sending the operator to hunt through a YAML file for a
+ * value that was never in it.
+ *
+ * Checking here, at the boundary where the flag still exists, is also what
+ * keeps the orchestrator's message TRUE for the ids that genuinely did come
+ * from the config. Its guard is untouched and still the real backstop — it is
+ * what stands between a mistyped id and a run that waives every runner (see
+ * assertKnownRunners), and it still covers anything calling runAudit()
+ * directly. This only means the CLI stops handing it a question it cannot
+ * answer accurately.
+ */
+function runnerIds(flag: string, raw: string): string[] {
+  const ids = raw.split(",").map((s) => s.trim());
+  const unknown = ids.filter((id) => !KNOWN_RUNNER_IDS.includes(id));
+  if (unknown.length > 0) {
+    // Quoted: an id that is empty or still carries whitespace is otherwise
+    // invisible in the error that names it.
+    console.error(
+      pc.red(
+        `unknown runner id${unknown.length === 1 ? "" : "s"} in ${flag}: ` +
+          `${unknown.map((u) => `"${u}"`).join(", ")}. ` +
+          `Known runners: ${KNOWN_RUNNER_IDS.join(", ")}`,
+      ),
+    );
+    process.exit(2);
+  }
+  return ids;
+}
+
 const HERE = dirname(fileURLToPath(import.meta.url));
 const SITES_DIR = resolve(HERE, "..", "sites");
 
@@ -72,7 +112,7 @@ program
       }
       cfg.failOn = opts.failOn;
     }
-    if (opts.skip) cfg.skip = [...(cfg.skip ?? []), ...String(opts.skip).split(",")];
+    if (opts.skip) cfg.skip = [...(cfg.skip ?? []), ...runnerIds("--skip", String(opts.skip))];
 
     const isLocal = /^(https?:\/\/)?(localhost|127\.0\.0\.1)/.test(cfg.baseUrl);
     if (opts.allowActive && !isLocal) {
@@ -82,7 +122,7 @@ program
       process.exit(2);
     }
 
-    const only = opts.only ? String(opts.only).split(",").map((s: string) => s.trim()) : undefined;
+    const only = opts.only ? runnerIds("--only", String(opts.only)) : undefined;
 
     console.log(pc.bold(`\nlgtm ${cfg.name} → ${cfg.baseUrl}\n`));
     const report = await runAudit({
