@@ -176,6 +176,12 @@ budget), so it fails fast and clear.
   and ZAP falls back to a passive baseline.
 - Captured sessions, reports, and your real site configs are all git-ignored.
 
+## Contributors
+
+<!-- contributors:start -->
+<a href="https://github.com/42piratas" title="42piratas"><img src="https://avatars.githubusercontent.com/u/18232600?v=4&s=64" width="64" height="64" alt="42piratas" /></a>
+<!-- contributors:end -->
+
 ## License
 
 Open source — [AGPL-3.0](LICENSE). Commercial — contact ahoy@42labs.io.
