@@ -138,3 +138,58 @@ describe("cli.ts — run operator errors exit 2, not the gate-failure code", () 
   // Same suite budget as the other two CLI tests: each case is a real
   // `npx tsx` subprocess, which outruns the global 5s testTimeout on CI.
 }, 40_000);
+
+// `auth` had the same three load-time paths as `run`, through the same
+// `loadSite(sitePath(site))` call, and the same stack trace when any of them
+// failed. It now goes through loadSiteOrExit too. Its own operator check —
+// auth.type is not storageState — already exited 2 and is pinned here so that
+// sharing the helper cannot have changed it.
+//
+// Every case in this block MUST exit before `chromium.launch()`. `auth` opens
+// a real, non-headless browser and then blocks on stdin until someone presses
+// Enter; a test that got that far would hang the suite with a window open on
+// the CI runner and never time out on its own. The ordering in the action
+// body is what makes this safe: loadSiteOrExit runs first, the auth.type
+// check second, and the launch only after both have passed. Nothing here
+// passes both. With stdin set to "ignore" by runCli there is also no one to
+// press Enter, so a regression that reordered them would hang rather than
+// fail — which is why the cases are chosen to be provably unreachable rather
+// than merely quick.
+describe("cli.ts — auth operator errors exit 2, and never reach the browser", () => {
+  it("refuses an unknown site slug without a trace", () => {
+    const r = runCli(["auth", "nosuchsite"]);
+    expect(r.status).toBe(2);
+    expect(r.stderr).toMatch(/site config not found: nosuchsite/);
+    expect(r.stderr).not.toMatch(TRACE);
+  });
+
+  it("refuses a config that isn't valid YAML", () => {
+    const path = writeConfig('name: t\nbaseUrl: "https://example.com"\n  oops: [\n');
+    const r = runCli(["auth", path]);
+    expect(r.status).toBe(2);
+    expect(r.stderr).toMatch(/could not parse site config/i);
+    expect(r.stderr).toContain(path);
+    expect(r.stderr).not.toMatch(TRACE);
+  });
+
+  it("names the offending field when the config fails validation", () => {
+    const path = writeConfig("name: t\nbaseUrl: not-a-url\n");
+    const r = runCli(["auth", path]);
+    expect(r.status).toBe(2);
+    expect(r.stderr).toMatch(/invalid site config/i);
+    expect(r.stderr).toMatch(/baseUrl/);
+    expect(r.stderr).not.toMatch(TRACE);
+  });
+
+  it("still refuses a site whose auth.type is not storageState, exactly as before", () => {
+    // A config that loads cleanly, so this is the first case to get PAST
+    // loadSiteOrExit — and the auth.type check is the only thing left between
+    // it and the browser. `auth` defaults to `{ type: "none" }` when omitted
+    // (see config.ts), which is what trips it.
+    const path = writeConfig("name: t\nbaseUrl: https://example.com\n");
+    const r = runCli(["auth", path]);
+    expect(r.status).toBe(2);
+    expect(r.stderr).toMatch(/auth\.type != storageState/);
+    expect(r.stderr).not.toMatch(TRACE);
+  });
+}, 40_000);

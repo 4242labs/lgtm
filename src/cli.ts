@@ -79,15 +79,18 @@ function sitePath(name: string): string {
 }
 
 /**
- * Resolve + load a site config, refusing an operator's mistake the way the
- * rest of `run` already does: one message, exit 2.
+ * Resolve + load a site config, refusing an operator's mistake the way every
+ * other operator check in `run` and `auth` already does: one message, exit 2.
  *
  * The exit code is the point, more than the tidier output. `1` is documented
  * as "a finding met the site's failOn threshold" and CI is told to gate on it,
  * so a config that never parsed exiting `1` tells a workflow step the audit
  * ran and failed — when in fact nothing was ever audited. `2` is already the
  * convention here for operator error (--fail-on typo, --allow-active refusal,
- * auth type mismatch); these three paths just never joined it.
+ * auth type mismatch); these three paths just never joined it. `auth` shares
+ * this rather than keeping its own copy so the two commands cannot drift —
+ * the same typo in the same file should be refused the same way whichever
+ * one the operator ran.
  *
  * Deliberately narrow. Only the three failures whose provenance is known are
  * caught — the slug missing, the YAML not parsing, the schema rejecting it.
@@ -229,7 +232,7 @@ program
   .argument("<site>", "site slug")
   .option("--url <url>", "login start URL (defaults to site baseUrl)")
   .action(async (site: string, opts) => {
-    const cfg = loadSite(sitePath(site));
+    const cfg = loadSiteOrExit(site);
     if (cfg.auth.type !== "storageState") {
       console.error(pc.red(`site '${cfg.name}' has auth.type != storageState; nothing to capture.`));
       process.exit(2);
