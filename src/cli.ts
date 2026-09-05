@@ -5,11 +5,13 @@ import { resolve, join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import pc from "picocolors";
 import { chromium } from "playwright";
+import { YAMLParseError } from "yaml";
+import { ZodError } from "zod";
 import { loadSite } from "./config.js";
-import { runAudit } from "./orchestrator.js";
+import { runAudit, UnknownRunnerError } from "./orchestrator.js";
 import { writeReports, consoleSummary } from "./report.js";
 import { ALL_RUNNERS } from "./runners/index.js";
-import { SEVERITY_ORDER, type Severity } from "./types.js";
+import { SEVERITY_ORDER, type AuditReport, type Severity, type SiteConfig } from "./types.js";
 
 // The CLI-facing subset: `info` is a real Severity, but computePass() (see
 // scoring.ts) already skips every info-severity finding regardless of
@@ -62,12 +64,79 @@ function runnerIds(flag: string, raw: string): string[] {
 const HERE = dirname(fileURLToPath(import.meta.url));
 const SITES_DIR = resolve(HERE, "..", "sites");
 
+/** A slug or path that resolves to no config on disk. Named so the caller can
+ *  tell it from an unexpected failure without matching on message text. */
+class SiteNotFoundError extends Error {
+  readonly name = "SiteNotFoundError";
+}
+
 function sitePath(name: string): string {
   const direct = resolve(process.cwd(), name);
   if (existsSync(direct) && name.endsWith(".yaml")) return direct;
   const inDir = join(SITES_DIR, `${name}.yaml`);
   if (existsSync(inDir)) return inDir;
-  throw new Error(`site config not found: ${name} (looked in ${SITES_DIR})`);
+  throw new SiteNotFoundError(`site config not found: ${name} (looked in ${SITES_DIR})`);
+}
+
+/**
+ * Resolve + load a site config, refusing an operator's mistake the way every
+ * other operator check in `run` and `auth` already does: one message, exit 2.
+ *
+ * The exit code is the point, more than the tidier output. `1` is documented
+ * as "a finding met the site's failOn threshold" and CI is told to gate on it,
+ * so a config that never parsed exiting `1` tells a workflow step the audit
+ * ran and failed — when in fact nothing was ever audited. `2` is already the
+ * convention here for operator error (--fail-on typo, --allow-active refusal,
+ * auth type mismatch); these three paths just never joined it. `auth` shares
+ * this rather than keeping its own copy so the two commands cannot drift —
+ * the same typo in the same file should be refused the same way whichever
+ * one the operator ran.
+ *
+ * Deliberately narrow. Only the three failures whose provenance is known are
+ * caught — the slug missing, the YAML not parsing, the schema rejecting it.
+ * Everything else (an unreadable file, a bug in here) is rethrown untouched,
+ * because for a genuine crash the stack trace is the most useful thing on the
+ * screen and swallowing it would cost more than the noise it saves.
+ *
+ * loadSite()'s own contract is unchanged: it still throws ZodError /
+ * YAMLParseError to every caller. This classifies at the CLI boundary rather
+ * than making the library quieter for programmatic users.
+ */
+function loadSiteOrExit(site: string): SiteConfig {
+  // Resolved first and separately, so the two messages below can name the file
+  // that actually failed rather than echoing back the argument. `run example`
+  // reporting "invalid site config example" leaves the operator to work out
+  // which file that was; sitePath's own not-found message already answers that
+  // question by printing where it looked.
+  let path: string;
+  try {
+    path = sitePath(site);
+  } catch (err) {
+    if (err instanceof SiteNotFoundError) {
+      console.error(pc.red(err.message));
+      process.exit(2);
+    }
+    throw err;
+  }
+
+  try {
+    return loadSite(path);
+  } catch (err) {
+    if (err instanceof YAMLParseError) {
+      console.error(pc.red(`could not parse site config ${path}: ${err.message}`));
+      process.exit(2);
+    }
+    if (err instanceof ZodError) {
+      // Field-by-field. A bare ZodError prints as a JSON dump of `issues`,
+      // which buries the one line that says which key is wrong.
+      const lines = err.issues.map(
+        (i) => `  ${i.path.length > 0 ? i.path.join(".") : "(root)"} — ${i.message}`,
+      );
+      console.error(pc.red(`invalid site config ${path}:\n${lines.join("\n")}`));
+      process.exit(2);
+    }
+    throw err;
+  }
 }
 
 /** YYMMDD-HHMM in local time. */
@@ -93,7 +162,7 @@ program
   .option("--allow-active", "enable active/mutating scans (localhost only)", false)
   .option("--fail-on <sev>", "override failOn threshold (critical|high|medium|low)")
   .action(async (site: string, opts) => {
-    const cfg = loadSite(sitePath(site));
+    const cfg = loadSiteOrExit(site);
     if (opts.url) cfg.baseUrl = opts.url;
     if (opts.failOn !== undefined) {
       // computePass()/atLeastAsSevere() index into SEVERITY_ORDER; a typo'd
@@ -125,15 +194,30 @@ program
     const only = opts.only ? runnerIds("--only", String(opts.only)) : undefined;
 
     console.log(pc.bold(`\nlgtm ${cfg.name} → ${cfg.baseUrl}\n`));
-    const report = await runAudit({
-      site: cfg,
-      baseUrl: cfg.baseUrl,
-      outDir: process.cwd(),
-      stamp: stamp(),
-      allowActive: Boolean(opts.allowActive),
-      only,
-      log: (m) => console.log(m),
-    });
+    let report: AuditReport;
+    try {
+      report = await runAudit({
+        site: cfg,
+        baseUrl: cfg.baseUrl,
+        outDir: process.cwd(),
+        stamp: stamp(),
+        allowActive: Boolean(opts.allowActive),
+        only,
+        log: (m) => console.log(m),
+      });
+    } catch (err) {
+      // The last operator-error path in `run`: a bad id in the site config's
+      // `skip:` reaches assertKnownRunners, not loadSite, so the catch above
+      // cannot see it. Same treatment, same code. Only this one class is
+      // caught — a runner blowing up mid-audit is a real crash and keeps its
+      // trace. assertKnownRunners runs before any Docker/network/browser
+      // work, so nothing has been done by the time this fires.
+      if (err instanceof UnknownRunnerError) {
+        console.error(pc.red(err.message));
+        process.exit(2);
+      }
+      throw err;
+    }
 
     const paths = writeReports(report);
     console.log(consoleSummary(report));
@@ -148,7 +232,7 @@ program
   .argument("<site>", "site slug")
   .option("--url <url>", "login start URL (defaults to site baseUrl)")
   .action(async (site: string, opts) => {
-    const cfg = loadSite(sitePath(site));
+    const cfg = loadSiteOrExit(site);
     if (cfg.auth.type !== "storageState") {
       console.error(pc.red(`site '${cfg.name}' has auth.type != storageState; nothing to capture.`));
       process.exit(2);

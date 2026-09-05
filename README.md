@@ -101,7 +101,9 @@ npm run audit -- list      # runners + configured sites
 
 The report lands in `reports/<site>/<site>-<stamp>.html` (+ `.json` for CI). Exit
 code is `0` on pass, `1` when any finding meets the site's `failOn` threshold —
-wire it into CI as a gate.
+wire it into CI as a gate. `2` means operator error — a bad flag, a missing or
+invalid site config — and never that a site was audited and failed, so a gate
+can tell "this build has a critical finding" from "this run never started".
 
 ## Authenticated surfaces
 

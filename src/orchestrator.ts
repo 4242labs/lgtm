@@ -90,6 +90,19 @@ function gate(
 }
 
 /**
+ * Thrown by assertKnownRunners, and only by it.
+ *
+ * The refusal itself is unchanged — a named type is what lets a caller tell
+ * "the operator typed a runner id that does not exist" apart from "a runner
+ * crashed mid-audit", without matching on message text. cli.ts uses it to
+ * print this as an operator error and exit 2; every other caller keeps the
+ * throw, and anything that is not this class keeps its stack trace.
+ */
+export class UnknownRunnerError extends Error {
+  readonly name = "UnknownRunnerError";
+}
+
+/**
  * A runner id nobody recognises is a typo, and a typo must never quietly widen
  * into a waiver.
  *
@@ -102,7 +115,7 @@ function gate(
 function assertKnownRunners(kind: string, ids: string[] | undefined): void {
   const unknown = (ids ?? []).filter((id) => !ALL_RUNNERS.some((r) => r.id === id));
   if (unknown.length > 0) {
-    throw new Error(
+    throw new UnknownRunnerError(
       `unknown runner id${unknown.length === 1 ? "" : "s"} in ${kind}: ${unknown.join(", ")}. ` +
         `Known runners: ${ALL_RUNNERS.map((r) => r.id).join(", ")}`,
     );
